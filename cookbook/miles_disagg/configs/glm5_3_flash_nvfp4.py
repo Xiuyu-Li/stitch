@@ -55,6 +55,7 @@ SGLANG_RUNTIME = SGLangRuntime(
     patches=(
         Path(__file__).resolve().parents[1] / "patches/sglang-glm5-next-stitch.patch",
         Path(__file__).resolve().parents[1] / "patches/sglang-kpool-topk-backend.patch",
+        Path(__file__).resolve().parents[1] / "patches/sglang-glm-language-model-only.patch",
     ),
     image_run_commands=(
         "uv pip install --system --break-system-packages --no-deps flashinfer-python==0.6.18",
@@ -90,6 +91,7 @@ SGLANG_SERVER_ARGS = {
     "--ep": "8",
     "--load-format": "safetensors",
     "--quantization": "modelopt_fp4",
+    "--language-model-only": "",
     "--reasoning-parser": "glm45",
     "--tool-call-parser": "glm47",
     "--context-length": "65544",
