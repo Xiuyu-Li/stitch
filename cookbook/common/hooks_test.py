@@ -18,12 +18,34 @@ from base64 import b64encode
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from cookbook.common import hooks
 from stitch.stores.modal_volume import ModalVolumeStore
 from stitch.stores.s3 import S3Store
 from stitch.types import VersionRef
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (409, "", True),
+        (429, "", True),
+        (503, "Server is at capacity", True),
+        (503, '{"error":{"message":"The request queue is full."}}', True),
+        (503, '{"detail":"The request queue is full."}', True),
+        (503, "upstream disconnected", False),
+        (502, "Server is at capacity", False),
+        (503, '{"error":{"message":"generation failed"}}', False),
+        (503, "null", False),
+        (503, "[]", False),
+        (200, "Server is at capacity", False),
+    ],
+)
+def test_retry_rejected_request(status, body, expected):
+    response = httpx.Response(status, text=body)
+    assert hooks.retry_rejected_request(response) is expected
 
 
 class _FakePool:
@@ -478,8 +500,4 @@ def test_request_hook_cache_switches_runs() -> None:
 
 
 if __name__ == "__main__":
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for t in tests:
-        t()
-        print(f"  ok  {t.__name__}")
-    print(f"common hooks harness: {len(tests)} PASS")
+    raise SystemExit(pytest.main([__file__]))

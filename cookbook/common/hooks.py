@@ -117,6 +117,29 @@ async def gated_rollout_request_hook(
     request["retry_sleep"] = float(
         getattr(args, "rollout_request_retry_sleep", request.get("retry_sleep", 1.0))
     )
+    request["retry_response"] = retry_rejected_request
+
+
+def retry_rejected_request(response: Any) -> bool:
+    """Retry only explicit admission rejection, before stateful generation starts."""
+    if response.status_code in (409, 429):
+        return True
+    if response.status_code != 503:
+        return False
+    if response.text.strip() == "Server is at capacity":
+        return True
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    message = error.get("message") if isinstance(error, dict) else None
+    return (
+        message == "The request queue is full."
+        or body.get("detail") == "The request queue is full."
+    )
 
 
 class _CachedPointer:
