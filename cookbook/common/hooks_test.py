@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import tempfile
+import threading
 from base64 import b64encode
 from pathlib import Path
 from types import SimpleNamespace
@@ -399,12 +400,13 @@ def test_request_hook_min_lag() -> None:
         assert request["max_retries"] == 900
 
 
-def test_request_hook_reads_shared_mount_without_reload() -> None:
+def test_request_hook_reads_pointer_without_reloading_mount(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         store = ModalVolumeStore(root, run_id="run-abc")
         store.advance_pointer(VersionRef("run-abc", 1))
         pointer = hooks._CachedPointer()
+        monkeypatch.setattr(hooks, "_store", lambda args: store)
         original_refresh = ModalVolumeStore.refresh
 
         def unexpected_refresh(_store) -> None:
@@ -497,6 +499,36 @@ def test_request_hook_cache_switches_runs() -> None:
             "min_version": 3,
             "exact_version": None,
         }
+
+
+def test_pointer_refresh_does_not_block_requests_or_duplicate_reads(monkeypatch):
+    release = threading.Event()
+    reads = []
+
+    def read_pointer():
+        reads.append(True)
+        if not release.wait(timeout=1):
+            raise TimeoutError("Request loop could not release the pointer read")
+        return VersionRef("run-a", 8)
+
+    monkeypatch.setattr(
+        hooks, "_store", lambda args: SimpleNamespace(read_pointer=read_pointer)
+    )
+
+    async def check():
+        cache = hooks._CachedPointer()
+        args = _args("/stitch/run-a", run_id="run-a")
+        requests = [asyncio.create_task(cache.get(args)) for _ in range(8)]
+        try:
+            await asyncio.sleep(0.02)
+            assert not any(request.done() for request in requests)
+            assert len(reads) == 1
+        finally:
+            release.set()
+        assert await asyncio.gather(*requests) == [8] * 8
+        assert len(reads) == 1
+
+    asyncio.run(check())
 
 
 if __name__ == "__main__":
