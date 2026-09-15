@@ -252,18 +252,32 @@ def test_resolve_resume_point_rejects_a_mislabeled_publication() -> None:
         resolve_resume_point(volume, source_run_id="old", save_hf=_Config.save_hf)
 
 
-def test_resolve_resume_point_skips_iteration_zero() -> None:
+@pytest.mark.parametrize("require_durable", [False, True])
+def test_resolve_resume_point_recovers_the_first_saved_update(require_durable) -> None:
     volume = _Volume(
         {
+            "old/latest": b"old/weight_v000002",
             "old/checkpoints/latest_checkpointed_iteration.txt": b"0\n",
-            "old/checkpoints/iter_0000000/state": b"checkpoint",
+            "old/checkpoints/iter_0000000/.stitch-complete": b"",
+            "old/checkpoints/iter_0000001/state": b"unfinished checkpoint",
             "old/hf_checkpoints/weight_v000000/.complete": b"",
+            "old/hf_checkpoints/weight_v000001/.complete": b"",
             **_published(1),
+            **_published(2),
         }
     )
 
-    with pytest.raises(ValueError, match="no complete Megatron/HF checkpoint pair"):
-        resolve_resume_point(volume, source_run_id="old", save_hf=_Config.save_hf)
+    point = prepare_attempt(
+        volume,
+        run_id="old",
+        save_hf=_Config.save_hf,
+        require_durable=require_durable,
+    )
+
+    assert point is not None
+    assert (point.iteration, point.version) == (0, 1)
+    assert volume.files["old/latest"] == b"old/weight_v000001"
+    assert "old/checkpoints/iter_0000000/.stitch-complete" in volume.files
 
 
 def test_resolve_resume_point_requires_a_complete_checkpoint_pair() -> None:

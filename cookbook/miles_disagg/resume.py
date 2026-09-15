@@ -116,8 +116,7 @@ def resolve_resume_point(
     for entry in volume.iterdir(str(checkpoint_root), recursive=False):
         if match := re.fullmatch(r"iter_(\d+)", PurePosixPath(entry.path).name):
             iteration = int(match.group(1))
-            # A fresh actor also reports iteration 0, so it never resumes.
-            if 0 < iteration <= tracked_iteration:
+            if iteration <= tracked_iteration:
                 iterations.append(iteration)
 
     save_hf = _validate_save_hf_template(save_hf)

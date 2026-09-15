@@ -405,6 +405,7 @@ class Trainer:
             return
 
         resume_point = self.resume_point
+        boot_version = resume_point.version if resume_point is not None else 0
 
         cfg.rollout_endpoint_url = ModalFlashPool(APP_NAME, "Server").gateway_url()
         if resume_point is not None:
@@ -426,6 +427,7 @@ class Trainer:
             "experiment_volume_name": exp.EXPERIMENT_VOLUME_NAME,
             "rollout_modal_flash_app_name": APP_NAME,
             "rollout_modal_flash_server_cls_name": "Server",
+            "rollout_initial_weight_version": boot_version,
             "run_id": RUN_ID,
         }
         cfg.custom_config_path = custom_config
@@ -440,7 +442,6 @@ class Trainer:
         # Claim the version already served by the pool before Miles publishes.
         from cookbook.common import hooks
 
-        boot_version = resume_point.version if resume_point is not None else 0
         hooks.claim_pool(
             SimpleNamespace(
                 update_weight_disk_dir=cfg.update_weight_disk_dir, **custom_config
