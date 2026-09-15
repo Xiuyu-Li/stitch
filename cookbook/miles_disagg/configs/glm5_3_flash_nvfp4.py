@@ -36,6 +36,11 @@ TRAINER_IMAGE_RUN_COMMANDS = (
     " -- miles miles_plugins scripts/models scripts/run_glm5_3_flash.py"
     " > /tmp/glm5-next.patch"
     " && git -C /root/miles apply /tmp/glm5-next.patch",
+    "git -C /sgl-workspace/sglang apply - <<'PATCH'\n"
+    + (
+        Path(__file__).resolve().parents[1] / "patches/sglang-spawn-cuda-rebuild.patch"
+    ).read_text()
+    + "PATCH",
 )
 TRAINER_EXTRA_PIP_PACKAGES = base.TRAINER_EXTRA_PIP_PACKAGES
 MEGATRON_RUNTIME_PATCHES = [
@@ -49,6 +54,7 @@ SGLANG_RUNTIME = SGLangRuntime(
     commit="9a26e7490f8db83a7fde29ae38f3bbff50ba035c",
     patches=(
         Path(__file__).resolve().parents[1] / "patches/sglang-glm5-next-stitch.patch",
+        Path(__file__).resolve().parents[1] / "patches/sglang-kpool-topk-backend.patch",
     ),
     image_run_commands=(
         "uv pip install --system --break-system-packages --no-deps flashinfer-python==0.6.18",
@@ -68,6 +74,11 @@ SGLANG_SERVER_ENV = {
     for key, value in base.SGLANG_SERVER_ENV.items()
     if not key.startswith("SGLANG_DSA_")
 }
+SGLANG_SERVER_ENV.update(
+    SGLANG_DSA_FUSE_TOPK="1",
+    SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC="1",
+    SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK="large",
+)
 LOCAL_CHECKPOINT_PATH = "/local-checkpoint"
 SGLANG_DELTA_UPDATE_MODE = "disk"
 SIDECAR_COMMIT_MODE = "in_place"
@@ -86,6 +97,7 @@ SGLANG_SERVER_ARGS = {
     "--attention-backend": "dsa",
     "--dsa-prefill-backend": "tilelang",
     "--dsa-decode-backend": "tilelang",
+    "--dsa-topk-backend": "flashinfer",
     "--kv-cache-dtype": "bfloat16",
     "--moe-runner-backend": "flashinfer_trtllm_routed",
     "--disable-shared-experts-fusion": "",
