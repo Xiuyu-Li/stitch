@@ -1,20 +1,11 @@
-"""Download Kimi K3 and validate one complete MXFP4 delta update on Modal.
+"""Profile one GLM-5.3-Flash FP8 delta weight update on eight B300s.
 
-Disk destination:
+The entrypoint downloads the pinned public checkpoint, constructs one
+deterministic element-wise synthetic delta, and verifies one complete update.
 
-    uv run --extra modal modal run -d \
-      tools/profiling/kimi_k3_mxfp4_delta_weight_update.py
-
-CPU destination with the canonical checkpoint on local storage:
-
-    uv run --extra modal modal run -d \
-      tools/profiling/kimi_k3_mxfp4_delta_weight_update.py \
-      --update-mode cpu --canonical-storage disk
-
-``--canonical-storage`` applies only with ``--update-mode cpu``; use
-``--canonical-storage memory`` only when the host can retain both the
-canonical checkpoint and TP rank images. ``--update-mode disk`` profiles the
-disk destination instead of rank-ready CPU staging.
+    MODAL_FUNCTION_RUNTIME=runc uv run --extra modal modal run -d \
+      tools/profiling/glm5_3_flash_fp8_delta_weight_update.py \
+      --update-mode cpu --canonical-storage memory
 """
 
 from __future__ import annotations
@@ -48,57 +39,53 @@ from tools.profiling._synthetic_delta import (
     synthetic_delta_profile_id,
 )
 
-ROLLOUT_MODEL = "moonshotai/Kimi-K3"
-ROLLOUT_REVISION = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
+APP_NAME = "profile-glm5-3-flash-fp8-delta-weight-update"
+EXPERIMENT = "glm5_3_flash_fp8"
+ROLLOUT_MODEL = "zai-org/GLM-5.3-Flash"
+ROLLOUT_REVISION = "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
 ROLLOUT_GPUS = 8
-GPU = "B300"
-MEMORY_MIB = (1048576, 4194304)
-EPHEMERAL_DISK_MIB = 2097152
-SGLANG_SERVER_ARGS = {
-    "--tp": "8",
-    "--trust-remote-code": "",
-    "--load-format": "fastsafetensors",
-    "--model-loader-extra-config": '{"enable_gds":false}',
-    "--weight-loader-drop-cache-after-load": "",
-    "--enable-cpu-weight-cache": "",
-    "--cpu-weight-cache-max-compile-group-gb": "16",
-    "--cpu-weight-cache-canonical-checkpoint-dir": "/local-checkpoint/canonical",
-    "--dist-timeout": "3600",
-    "--context-length": "1048576",
-    "--max-running-requests": "32",
-    "--cuda-graph-max-bs-decode": "32",
-    "--mem-fraction-static": "0.85",
-    "--kv-cache-dtype": "fp8_e4m3",
-    "--mamba-ssm-dtype": "bfloat16",
-    "--mamba-radix-cache-strategy": "extra_buffer_lazy",
-    "--chunked-prefill-size": "16384",
-    "--schedule-policy": "lpm",
-    "--mm-feature-transport": "cuda_ipc",
-    "--mm-processor-worker-num": "2",
-    "--mm-io-worker-num": "16",
-    "--reasoning-parser": "kimi_k3",
-    "--tool-call-parser": "kimi_k3",
-}
-
-APP_NAME = "profile-kimi-k3-mxfp4-delta-weight-update"
-EXPERIMENT = "kimi_k3_mxfp4"
 HF_CACHE_PATH = "/root/.cache/huggingface"
 DELTA_MOUNT = "/synthetic-delta"
 DELTA_SPEC = SyntheticDeltaSpec(
-    checkpoint_format="mxfp4",
-    quantized_value_density=0.003,
+    checkpoint_format="fp8",
+    quantized_value_density=0.006,
     high_precision_value_density=0.01,
-    # Text-only RL leaves the vision encoder and projector fixed.
-    immutable_prefixes=("vision_tower.", "mm_projector."),
+    # Text-policy training leaves the vision tower and native MTP layer fixed.
+    immutable_prefixes=(
+        "model.visual.",
+        "model.language_model.layers.45.",
+    ),
 )
-DELTA_ID = f"kimi-k3/{ROLLOUT_REVISION}/{synthetic_delta_profile_id(DELTA_SPEC)}"
+DELTA_ID = f"glm5-3-flash/{ROLLOUT_REVISION}/{synthetic_delta_profile_id(DELTA_SPEC)}"
 DELTA_SOURCE_DIR = f"{DELTA_MOUNT}/{DELTA_ID}"
-BASE_CHECKPOINT_DIR = "/local-checkpoint/kimi-k3-mxfp4/base"
-LOCAL_TARGET_CHECKPOINT_DIR = "/local-checkpoint/kimi-k3-mxfp4/target"
-CPU_CACHE_GROUP_GB = "16"
-CANONICAL_CHECKPOINT_DIR = "/local-checkpoint/kimi-k3-mxfp4/canonical"
+BASE_CHECKPOINT_DIR = "/local-checkpoint/glm5-3-flash-fp8/base"
+LOCAL_TARGET_CHECKPOINT_DIR = "/local-checkpoint/glm5-3-flash-fp8/target"
+LOCAL_CANONICAL_CHECKPOINT_DIR = "/local-checkpoint/glm5-3-flash-fp8/canonical"
 SGLANG_CACHE_PATH = "/root/.cache/sglang"
 _REPO_ROOT = Path(__file__).resolve().parents[2] if modal.is_local() else Path("/root")
+
+SGLANG_SERVER_ARGS = {
+    "--served-model-name": ROLLOUT_MODEL,
+    "--load-format": "fastsafetensors",
+    "--model-loader-extra-config": '{"enable_gds":false}',
+    "--weight-loader-drop-cache-after-load": "",
+    "--dtype": "auto",
+    "--reasoning-parser": "glm45",
+    "--tool-call-parser": "glm47",
+    "--dist-timeout": "3600",
+    "--watchdog-timeout": "3600",
+    "--context-length": "32768",
+    "--dsa-prefill-backend": "trtllm",
+    "--dsa-decode-backend": "trtllm",
+    "--kv-cache-dtype": "fp8_e4m3",
+    "--moe-runner-backend": "flashinfer_trtllm",
+    "--mem-fraction-static": "0.80",
+    "--chunked-prefill-size": "16384",
+    "--max-running-requests": "32",
+    "--decode-log-interval": "100",
+    "--random-seed": "42",
+    "--skip-server-warmup": "",
+}
 
 app = modal.App(APP_NAME)
 hf_cache_volume = modal.Volume.from_name(
@@ -140,7 +127,6 @@ download_image = (
 serving_image = build_serving_image(
     hf_cache_path=HF_CACHE_PATH,
     experiment=EXPERIMENT,
-    extra_env=None,
 ).add_local_dir(
     str(_REPO_ROOT / "tools"),
     remote_path="/root/tools",
@@ -188,10 +174,7 @@ def download_model() -> str:
 )
 def prepare_delta() -> dict:
     return prepare_standard_delta(
-        local_cached_snapshot(
-            ROLLOUT_MODEL,
-            ROLLOUT_REVISION,
-        ),
+        local_cached_snapshot(ROLLOUT_MODEL, ROLLOUT_REVISION),
         DELTA_SOURCE_DIR,
         spec=DELTA_SPEC,
         commit=delta_volume.commit,
@@ -200,10 +183,10 @@ def prepare_delta() -> dict:
 
 @app.function(
     image=serving_image,
-    gpu=f"{GPU}:{ROLLOUT_GPUS}",
+    gpu=f"B300:{ROLLOUT_GPUS}",
     cpu=64,
-    memory=MEMORY_MIB,
-    ephemeral_disk=EPHEMERAL_DISK_MIB,
+    memory=(1024 * 1024, 3 * 1024 * 1024),
+    ephemeral_disk=1024 * 1024,
     volumes={
         HF_CACHE_PATH: hf_cache_volume.read_only(),
         DELTA_MOUNT: delta_volume.read_only(),
@@ -218,21 +201,16 @@ def benchmark(
     sample_id: str,
 ) -> dict:
     materialize_checkpoint_view(
-        local_cached_snapshot(
-            ROLLOUT_MODEL,
-            ROLLOUT_REVISION,
-        ),
+        local_cached_snapshot(ROLLOUT_MODEL, ROLLOUT_REVISION),
         BASE_CHECKPOINT_DIR,
     )
-    server_args = dict(SGLANG_SERVER_ARGS)
-    server_args["--cpu-weight-cache-max-compile-group-gb"] = CPU_CACHE_GROUP_GB
     return run_delta_weight_update(
         WeightUpdateSpec(
-            model_name="Kimi K3 MXFP4",
+            model_name="GLM-5.3-Flash FP8",
             base_checkpoint_dir=BASE_CHECKPOINT_DIR,
             local_target_checkpoint_dir=LOCAL_TARGET_CHECKPOINT_DIR,
-            local_canonical_checkpoint_dir=CANONICAL_CHECKPOINT_DIR,
-            server_args=server_args,
+            local_canonical_checkpoint_dir=LOCAL_CANONICAL_CHECKPOINT_DIR,
+            server_args=SGLANG_SERVER_ARGS,
             tp_size=ROLLOUT_GPUS,
         ),
         source_dir=DELTA_SOURCE_DIR,
@@ -251,16 +229,13 @@ def main(
     sample_id: str = "1",
     skip_preparation: bool = False,
 ) -> None:
-    parsed_mode, parsed_storage = parse_update_destination(
-        update_mode,
-        canonical_storage,
-    )
+    mode, storage = parse_update_destination(update_mode, canonical_storage)
     if not skip_preparation:
         download_model.remote()
         prepare_delta.remote()
     benchmark.remote(
-        parsed_mode,
-        parsed_storage,
+        mode,
+        storage,
         modal_runtime_label(),
         sample_id,
     )

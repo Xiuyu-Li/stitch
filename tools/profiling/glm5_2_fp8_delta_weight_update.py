@@ -1,4 +1,4 @@
-"""Profile one GLM-5.2 FP8 delta weight update on four B300s.
+"""Profile one GLM-5.2 FP8 delta weight update on B300s.
 
 The entrypoint downloads the pinned public checkpoint, constructs one
 deterministic element-wise synthetic delta, and verifies one complete update.
@@ -10,6 +10,7 @@ deterministic element-wise synthetic delta, and verifies one complete update.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import modal
@@ -44,7 +45,6 @@ APP_NAME = "profile-glm5-2-fp8-delta-weight-update"
 EXPERIMENT = "glm5_2_fp8"
 ROLLOUT_MODEL = "zai-org/GLM-5.2-FP8"
 ROLLOUT_REVISION = "ba978f7d347eaf65d22f1a86833408afdb953541"
-ROLLOUT_GPUS = 4
 DELTA_MOUNT = "/synthetic-delta"
 DELTA_SPEC = SyntheticDeltaSpec(
     checkpoint_format="fp8",
@@ -80,8 +80,6 @@ SGLANG_SERVER_ARGS = {
     "--dsa-decode-backend": "flashmla_kv",
     "--dsa-topk-backend": "flashinfer",
     "--page-size": "64",
-    "--ep-size": str(ROLLOUT_GPUS),
-    "--moe-dense-tp-size": "1",
     "--moe-runner-backend": "flashinfer_trtllm_routed",
     "--disable-shared-experts-fusion": "",
     "--mem-fraction-static": "0.80",
@@ -196,9 +194,8 @@ def prepare_delta() -> dict:
     )
 
 
-@app.function(
+_BENCHMARK_FUNCTION_KWARGS = dict(
     image=serving_image,
-    gpu=f"B300:{ROLLOUT_GPUS}",
     cpu=64,
     memory=(1024 * 1024, 3 * 1024 * 1024),
     # Disk mode reconstructs the complete 756 GB target on local storage.
@@ -210,24 +207,51 @@ def prepare_delta() -> dict:
     },
     timeout=6 * 60 * 60,
 )
-def benchmark(
+
+
+def _benchmark(
+    *,
+    tp_size: int,
+    ep_size: int,
     update_mode: str,
     canonical_storage: str | None,
     runtime: str,
     sample_id: str,
 ) -> dict:
+    if tp_size not in {4, 8}:
+        raise ValueError("tp_size must be 4 or 8")
+    if ep_size < 1 or tp_size % ep_size != 0:
+        raise ValueError("ep_size must be a positive divisor of tp_size")
     materialize_checkpoint_view(
         local_cached_snapshot(ROLLOUT_MODEL, ROLLOUT_REVISION),
         BASE_CHECKPOINT_DIR,
     )
+    server_args = dict(SGLANG_SERVER_ARGS)
+    if ep_size > 1:
+        server_args["--ep-size"] = str(ep_size)
+    if tp_size == 8 and ep_size > 1:
+        # The pinned DeepGEMM stack cannot launch GLM-5.2 FP8's routed-MoE
+        # prefill kernel at the 28-token graph bucket on B300. Keep graph
+        # execution and pad that bucket to the next captured shape instead.
+        prefill_graph_bs = (
+            list(range(4, 28, 4))
+            + [32]
+            + list(range(48, 257, 16))
+            + list(range(288, 513, 32))
+            + list(range(576, 1025, 64))
+            + list(range(1280, 2049, 256))
+        )
+        server_args["--cuda-graph-config"] = json.dumps(
+            {"prefill": {"bs": prefill_graph_bs}}, separators=(",", ":")
+        )
     return run_delta_weight_update(
         WeightUpdateSpec(
             model_name="GLM-5.2 FP8",
             base_checkpoint_dir=BASE_CHECKPOINT_DIR,
             local_target_checkpoint_dir=LOCAL_TARGET_CHECKPOINT_DIR,
             local_canonical_checkpoint_dir=LOCAL_CANONICAL_CHECKPOINT_DIR,
-            server_args=SGLANG_SERVER_ARGS,
-            tp_size=ROLLOUT_GPUS,
+            server_args=server_args,
+            tp_size=tp_size,
         ),
         source_dir=DELTA_SOURCE_DIR,
         target_version=1,
@@ -238,18 +262,62 @@ def benchmark(
     )
 
 
+@app.function(gpu="B300:4", **_BENCHMARK_FUNCTION_KWARGS)
+def benchmark_tp4(
+    ep_size: int,
+    update_mode: str,
+    canonical_storage: str | None,
+    runtime: str,
+    sample_id: str,
+) -> dict:
+    return _benchmark(
+        tp_size=4,
+        ep_size=ep_size,
+        update_mode=update_mode,
+        canonical_storage=canonical_storage,
+        runtime=runtime,
+        sample_id=sample_id,
+    )
+
+
+@app.function(gpu="B300:8", **_BENCHMARK_FUNCTION_KWARGS)
+def benchmark_tp8(
+    ep_size: int,
+    update_mode: str,
+    canonical_storage: str | None,
+    runtime: str,
+    sample_id: str,
+) -> dict:
+    return _benchmark(
+        tp_size=8,
+        ep_size=ep_size,
+        update_mode=update_mode,
+        canonical_storage=canonical_storage,
+        runtime=runtime,
+        sample_id=sample_id,
+    )
+
+
 @app.local_entrypoint()
 def main(
     update_mode: str = "disk",
     canonical_storage: str | None = None,
+    tp_size: int = 4,
+    ep_size: int = 1,
     sample_id: str = "1",
     skip_preparation: bool = False,
 ) -> None:
     mode, storage = parse_update_destination(update_mode, canonical_storage)
+    if tp_size not in {4, 8}:
+        raise ValueError("tp_size must be 4 or 8")
+    if ep_size < 1 or tp_size % ep_size != 0:
+        raise ValueError("ep_size must be a positive divisor of tp_size")
     if not skip_preparation:
         download_model.remote()
         prepare_delta.remote()
+    benchmark = benchmark_tp4 if tp_size == 4 else benchmark_tp8
     benchmark.remote(
+        ep_size,
         mode,
         storage,
         modal_runtime_label(),
