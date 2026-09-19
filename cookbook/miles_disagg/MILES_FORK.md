@@ -57,6 +57,9 @@ The dated image supplies Megatron-LM, TransformerEngine, CUDA, and other
 compiled dependencies. Miles is installed over it with `--no-deps`, so the
 image and Miles revision must remain compatible.
 
+See the [runtime patches](patches/) listed in
+[`trainer_image.py`](trainer_image.py).
+
 ## Responsibilities
 
 Miles owns trainer-side state:
