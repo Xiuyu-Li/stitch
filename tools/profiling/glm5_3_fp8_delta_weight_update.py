@@ -131,7 +131,7 @@ def benchmark(
             tp_size=model.ROLLOUT_GPUS_PER_ENGINE,
         ),
         source_dir=DELTA_SOURCE_DIR,
-        target_version=1,
+        target_versions=(1,),
         update_mode=parse_update_mode(update_mode),
         canonical_storage=parse_canonical_storage(canonical_storage),
         runtime=runtime,
