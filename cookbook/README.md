@@ -174,12 +174,9 @@ Rollout capacity is controlled by `rollout_min_containers`,
 backpressure are controlled by `--max-running-requests` and
 `--max-queued-requests` in the recipe.
 
-The sidecar's HTTP connection pool retains HTTPX's defaults: 100 total connections
-and 20 retained idle connections. Set `proxy_max_connections` and
-`proxy_max_keepalive_connections` in `serve_startup`, or pass the sidecar flags
-`--proxy-max-connections` and `--proxy-max-keepalive-connections`, to size the pool
-for your workload. Allow for in-flight generation, queued requests, and control
-RPCs; these limits are independent of Modal's autoscaling target.
+Configure the sidecar's HTTP connection pool with `proxy_max_connections` (default
+100) and `proxy_max_keepalive_connections` (default 20 idle connections) in
+`serve_startup`, or with `--proxy-max-connections` / `--proxy-max-keepalive-connections`.
 
 After changing fleet or SGLang settings, redeploy the active run with the same
 experiment and run ID:

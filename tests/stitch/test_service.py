@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any
 
@@ -165,9 +166,10 @@ async def _asgi_post(
     return start["status"], headers, response_body
 
 
-def test_proxy_forwards_more_than_100_concurrent_requests(monkeypatch):
+@pytest.mark.parametrize("limit", [None, 128])
+def test_proxy_connection_limits(monkeypatch, limit):
     async def go():
-        arrived, release = asyncio.Event(), asyncio.Event()
+        arrived, release = {n: asyncio.Event() for n in (100, 128)}, asyncio.Event()
         count = 0
 
         async def handle(reader, writer):
@@ -178,29 +180,30 @@ def test_proxy_forwards_more_than_100_concurrent_requests(monkeypatch):
                     if line.lower().startswith(b"content-length:"):
                         await reader.readexactly(int(line.split(b":", 1)[1]))
                 count += 1
-                if count == 128:
-                    arrived.set()
+                if count in arrived:
+                    arrived[count].set()
                 # Hold all responses so the test exercises real HTTPX pool capacity.
                 await release.wait()
-                writer.write(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                    b"Content-Length: 2\r\nConnection: close\r\n\r\n{}"
-                )
+                writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
                 await writer.drain()
             finally:
                 writer.close()
                 await writer.wait_closed()
 
-        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        server = await asyncio.start_server(handle, "127.0.0.1", 0, backlog=128)
         port = server.sockets[0].getsockname()[1]
         engine = _ProxyEngine()
         monkeypatch.setattr(engine, "base_url", lambda: f"http://127.0.0.1:{port}")
         sidecar = _GateSidecar(VersionRef("run", 3))
-        app = create_app(sidecar.gate, sidecar, engine, proxy_max_connections=128)
+        options = {} if limit is None else {"proxy_max_connections": limit}
+        app = create_app(sidecar.gate, sidecar, engine, **options)
         async with server, app.router.lifespan_context(app):
             requests = [asyncio.create_task(_asgi_post(app, {})) for _ in range(128)]
             try:
-                await asyncio.wait_for(arrived.wait(), timeout=10)
+                await asyncio.wait_for(arrived[100].wait(), timeout=10)
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(arrived[128].wait(), 10 if limit else 1)
+                assert count == (limit or 100)
             finally:
                 release.set()
                 responses = await asyncio.gather(*requests)
