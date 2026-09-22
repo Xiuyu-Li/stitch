@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -36,6 +39,7 @@ class SGLangEngine(Engine):
         self._health_timeout = health_timeout
         self._weight_staging_timeout = weight_staging_timeout
         self._weight_update_timeout = weight_update_timeout
+        self._health_commit_lock = asyncio.Lock()
 
     def base_url(self) -> str:
         return self._base_url
@@ -59,6 +63,10 @@ class SGLangEngine(Engine):
 
     async def check_health(self) -> EngineHealth:
         """Require scheduler progress through SGLang's generation health probe."""
+        async with self._health_commit_lock:
+            return await self._check_health()
+
+    async def _check_health(self) -> EngineHealth:
         import httpx
 
         try:
@@ -139,6 +147,27 @@ class SGLangEngine(Engine):
 
     async def flush_cache(self) -> None:
         await self._get("/flush_cache", ok=(200, 404))
+
+    @asynccontextmanager
+    async def commit_guard(self, *, flush_cache: bool = False) -> AsyncIterator[None]:
+        # Watchdog state checks cannot exclude a probe already in flight. Keep
+        # this lock through pause/apply/resume, including failures and cancellation.
+        async with self._health_commit_lock:
+            if flush_cache:
+                # /health can return on another request's progress while its own
+                # scheduler/overlap state remains. Drain before pausing, with new
+                # probes excluded, so commit-time flushing cannot stall on it.
+                import httpx
+
+                async with httpx.AsyncClient(
+                    timeout=self._control_timeout + 5.0, trust_env=False
+                ) as client:
+                    response = await client.get(
+                        f"{self._base_url}/flush_cache",
+                        params={"timeout": self._control_timeout},
+                    )
+                _raise_for_engine(response, "pre-commit cache drain")
+            yield
 
     async def pause(self) -> None:
         await self._post(

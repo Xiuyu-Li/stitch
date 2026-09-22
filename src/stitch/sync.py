@@ -16,7 +16,13 @@ import logging
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager, contextmanager, suppress
+from contextlib import (
+    AbstractAsyncContextManager,
+    asynccontextmanager,
+    contextmanager,
+    nullcontext,
+    suppress,
+)
 from typing import Any, Literal
 
 from stitch.engines.base import Engine
@@ -145,13 +151,15 @@ class AdmissionGate:
         pause: Callable[[], Awaitable[None]] | None = None,
         resume: Callable[[], Awaitable[None]] | None = None,
         drain_all: bool = False,
+        guard: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> None:
         """Wait for the commit point, close the gate, apply, flip the served version
         (``on_applied``) while the gate is held, then reopen. ``on_applied`` runs only
         after a successful apply; in ``in_place`` the flip happens before ``resume``.
         ``drain_all`` marks an incompatible transition (a boot reset): drain and gate
         every request regardless of mode — rolling requests may cross a compatible
-        weight update, never a change of lineage (stitch#32)."""
+        weight update, never a change of lineage (stitch#32). The engine's optional
+        ``guard`` excludes health probes from before pause until after resume."""
         # Close admission before draining (stitch#32), else a new in_place request can straddle a boot reset.
         async with self._cond:
             self._committing = True
@@ -160,17 +168,18 @@ class AdmissionGate:
         try:
             async with self._cond:
                 await self._cond.wait_for(self._commit_ready)
-            if self.commit_mode == "in_place" and pause is not None:
-                await pause()
-                try:
+            async with guard() if guard is not None else nullcontext():
+                if self.commit_mode == "in_place" and pause is not None:
+                    await pause()
+                    try:
+                        await apply()
+                        on_applied()
+                    finally:
+                        if resume is not None:
+                            await resume()
+                else:
                     await apply()
                     on_applied()
-                finally:
-                    if resume is not None:
-                        await resume()
-            else:
-                await apply()
-                on_applied()
         finally:
             async with self._cond:
                 self._committing = False
@@ -537,6 +546,9 @@ class Reconciler:
                     on_applied=on_applied,
                     pause=self.engine.pause,
                     resume=self.engine.resume,
+                    guard=lambda: self.engine.commit_guard(
+                        flush_cache=self.flush_cache_on_commit
+                    ),
                 )
             except UnrecoverableSidecarError:
                 raise
@@ -583,6 +595,7 @@ class Reconciler:
                 pause=self.engine.pause if was_patched else None,
                 resume=self.engine.resume if was_patched else None,
                 drain_all=True,
+                guard=self.engine.commit_guard if was_patched else None,
             )
         except UnrecoverableSidecarError:
             raise

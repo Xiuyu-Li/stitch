@@ -7,11 +7,14 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
+from contextlib import asynccontextmanager
 from functools import partial
 
+import httpx
 import pytest
 
-from stitch.engines.base import Engine
+from stitch.engines.base import Engine, EngineHealthStatus
+from stitch.engines.sglang import SGLangEngine
 from stitch.errors import UnrecoverableEngineError, UnrecoverableSidecarError
 from stitch.stores.base import Store
 from stitch.sync import ConstraintUnmet, Reconciler
@@ -1045,6 +1048,159 @@ def test_version_flips_before_resume() -> None:
         assert seen["applied"] == VersionRef(
             "r1", 4
         )  # flipped under the gate, before resume
+
+    _run(go())
+
+
+@pytest.mark.parametrize("commit_mode", ["in_place", "quiesce"])
+@pytest.mark.parametrize("delta_update_mode", ["cpu", "disk"])
+@pytest.mark.parametrize("flush_cache", [False, True])
+def test_weight_commit_excludes_inflight_and_new_health_probes(
+    monkeypatch, commit_mode, delta_update_mode, flush_cache
+) -> None:
+    async def go() -> None:
+        probe_started, finish_probe = asyncio.Event(), asyncio.Event()
+        commit_entered, update_started = asyncio.Event(), asyncio.Event()
+        finish_update = asyncio.Event()
+        calls = []
+        paused = False
+        # A successful probe response need not have drained its scheduler state.
+        probe_residue = False
+        engine = SGLangEngine(
+            "http://engine", "/ckpt", delta_update_mode=delta_update_mode
+        )
+        r = _make_reconciler(
+            store=FakeStore(VersionRef("r1", 1), _delta("r1", 1, files=["v1"])),
+            engine=engine,
+            commit_mode=commit_mode,
+            flush_cache_on_commit=flush_cache,
+        )
+
+        async def handle(request):
+            nonlocal paused, probe_residue
+            path = request.url.path
+            if path == "/server_info":
+                return httpx.Response(
+                    200,
+                    json={
+                        "weight_update_staging": delta_update_mode,
+                        "weight_update_local_checkpoint_dir": "/ckpt",
+                    },
+                )
+            if path == "/model_info":
+                return httpx.Response(200, json={"weight_version": "0"})
+            if path == "/prepare_weight_update":
+                return httpx.Response(200, json={"success": True})
+            calls.append(path)
+            if path == "/health":
+                assert not paused
+                if not probe_started.is_set():
+                    probe_started.set()
+                    await finish_probe.wait()
+                    probe_residue = True
+            elif path == "/flush_cache":
+                assert not paused
+                assert request.url.params["timeout"] == "120.0"
+                probe_residue = False
+            elif path == "/pause_generation":
+                paused = True
+            elif path == "/commit_weight_update":
+                if flush_cache:
+                    assert not probe_residue, "cache flush needs scheduler progress"
+                update_started.set()
+                await finish_update.wait()
+            elif path == "/continue_generation":
+                if finish_update.is_set():
+                    assert r.applied == VersionRef("r1", 1)
+                paused = False
+            return httpx.Response(200, json={"success": True})
+
+        client = httpx.AsyncClient
+        transport = httpx.MockTransport(handle)
+        monkeypatch.setattr(
+            httpx, "AsyncClient", lambda **kw: client(transport=transport, **kw)
+        )
+        original_commit = r.gate.commit
+
+        async def observed_commit(**kwargs):
+            commit_entered.set()
+            await original_commit(**kwargs)
+
+        monkeypatch.setattr(r.gate, "commit", observed_commit)
+        async with asyncio.timeout(2), asyncio.TaskGroup() as tasks:
+            first_probe = tasks.create_task(engine.check_health())
+            await probe_started.wait()
+            updating = tasks.create_task(r.reconcile())
+            await commit_entered.wait()
+            assert calls == ["/health"], "commit raced an outstanding health probe"
+            finish_probe.set()
+            assert (await first_probe).status is EngineHealthStatus.HEALTHY
+            await update_started.wait()
+            next_probe = tasks.create_task(engine.check_health())
+
+            async def admit():
+                async with r.gate.admit() as version:
+                    return version
+
+            next_request = tasks.create_task(admit())
+            await asyncio.sleep(0)
+            assert not next_probe.done() and not next_request.done()
+            assert calls.count("/health") == 1
+            assert r.applied == VersionRef("r1", 0)
+            finish_update.set()
+            await updating
+            assert (await next_probe).status is EngineHealthStatus.HEALTHY
+            assert await next_request == VersionRef("r1", 1)
+            expected = ["/health"]
+            if flush_cache:
+                expected.append("/flush_cache")
+            if commit_mode == "in_place":
+                expected.append("/pause_generation")
+            expected.append("/commit_weight_update")
+            if commit_mode == "in_place":
+                expected.append("/continue_generation")
+            assert calls == [*expected, "/health"]
+
+    _run(go())
+
+
+@pytest.mark.parametrize("commit_mode", ["in_place", "quiesce"])
+@pytest.mark.parametrize("was_patched", [False, True])
+def test_boot_reset_uses_health_guard_only_when_mutating_weights(
+    commit_mode, was_patched
+) -> None:
+    async def go() -> None:
+        class GuardedEngine(FakeEngine):
+            @asynccontextmanager
+            async def commit_guard(self, *, flush_cache=False):
+                # A boot reset does not opt into cache flushing.
+                assert not flush_cache
+                self.calls.append("guard_enter")
+                try:
+                    yield
+                finally:
+                    self.calls.append("guard_exit")
+
+        engine = GuardedEngine()
+        r = _make_reconciler(
+            store=FakeStore(VersionRef("r2", 0)),
+            engine=engine,
+            commit_mode=commit_mode,
+            flush_cache_on_commit=True,
+        )
+        r.applied = VersionRef("r1", int(was_patched))
+        await r.reconcile()
+        expected = []
+        if was_patched:
+            expected += ["guard_enter"]
+            if commit_mode == "in_place":
+                expected += ["pause"]
+            expected += ["reset"]
+            if commit_mode == "in_place":
+                expected += ["resume"]
+            expected += ["guard_exit"]
+        assert engine.calls == expected
+        assert r.applied == VersionRef("r2", 0)
 
     _run(go())
 

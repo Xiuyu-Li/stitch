@@ -2,11 +2,14 @@
 
 ``engines/sglang.py`` is the working instance; ``engines/vllm.py`` sketches the vLLM
 shape. Subclasses override the methods they use —
-``initialize_update_destination`` and ``blocked_routes`` have safe defaults.
+``initialize_update_destination``, ``commit_guard`` and ``blocked_routes`` have
+safe defaults.
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -58,6 +61,17 @@ class Engine:
         """Evict the engine's prefix/KV cache — the standalone ``/flush_cache`` primitive.
         Commit-time eviction is controlled independently by ``commit(flush_cache=...)``."""
         raise NotImplementedError
+
+    @asynccontextmanager
+    async def commit_guard(self, *, flush_cache: bool = False) -> AsyncIterator[None]:
+        """Exclude health probes while a gated weight change runs.
+
+        Enter after admission closes and the required requests drain, before
+        pausing; exit after resuming. Engines with generation-based health checks
+        can drain residual probe work while the scheduler can still advance.
+        The default leaves engines without such probes unchanged.
+        """
+        yield
 
     async def pause(self) -> None:
         """Pause the scheduler in place (in_place commit); in-flight requests stay resident."""
