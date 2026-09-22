@@ -165,6 +165,50 @@ async def _asgi_post(
     return start["status"], headers, response_body
 
 
+def test_proxy_forwards_more_than_100_concurrent_requests(monkeypatch):
+    async def go():
+        arrived, release = asyncio.Event(), asyncio.Event()
+        count = 0
+
+        async def handle(reader, writer):
+            nonlocal count
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                for line in headers.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        await reader.readexactly(int(line.split(b":", 1)[1]))
+                count += 1
+                if count == 128:
+                    arrived.set()
+                # Hold all responses so the test exercises real HTTPX pool capacity.
+                await release.wait()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: 2\r\nConnection: close\r\n\r\n{}"
+                )
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        engine = _ProxyEngine()
+        monkeypatch.setattr(engine, "base_url", lambda: f"http://127.0.0.1:{port}")
+        sidecar = _GateSidecar(VersionRef("run", 3))
+        app = create_app(sidecar.gate, sidecar, engine, proxy_max_connections=128)
+        async with server, app.router.lifespan_context(app):
+            requests = [asyncio.create_task(_asgi_post(app, {})) for _ in range(128)]
+            try:
+                await asyncio.wait_for(arrived.wait(), timeout=10)
+            finally:
+                release.set()
+                responses = await asyncio.gather(*requests)
+            assert all(status == 200 for status, _, _ in responses)
+
+    asyncio.run(go())
+
+
 def test_upstream_transport_failure_is_retryable_and_releases_admission(
     monkeypatch, caplog
 ):
