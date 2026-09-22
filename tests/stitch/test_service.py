@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any
 
@@ -166,10 +165,11 @@ async def _asgi_post(
     return start["status"], headers, response_body
 
 
-@pytest.mark.parametrize("limit", [None, 128])
+@pytest.mark.parametrize("limit", [None, 128], ids=["default-100", "configured-128"])
 def test_proxy_connection_limits(monkeypatch, limit):
     async def go():
-        arrived, release = {n: asyncio.Event() for n in (100, 128)}, asyncio.Event()
+        arrived = {n: asyncio.Event() for n in (100, 128)}
+        release = asyncio.Event()
         count = 0
 
         async def handle(reader, writer):
@@ -184,7 +184,10 @@ def test_proxy_connection_limits(monkeypatch, limit):
                     arrived[count].set()
                 # Hold all responses so the test exercises real HTTPX pool capacity.
                 await release.wait()
-                writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: 2\r\nConnection: close\r\n\r\n{}"
+                )
                 await writer.drain()
             finally:
                 writer.close()
@@ -201,12 +204,21 @@ def test_proxy_connection_limits(monkeypatch, limit):
             requests = [asyncio.create_task(_asgi_post(app, {})) for _ in range(128)]
             try:
                 await asyncio.wait_for(arrived[100].wait(), timeout=10)
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(arrived[128].wait(), 10 if limit else 1)
-                assert count == (limit or 100)
+                if limit is None:
+                    # The default pool cannot forward the remaining 28 requests yet.
+                    with pytest.raises(TimeoutError):
+                        await asyncio.wait_for(arrived[128].wait(), timeout=1)
+                    assert count == 100
+                else:
+                    # Ignoring the configured limit must fail here, not be suppressed.
+                    await asyncio.wait_for(arrived[128].wait(), timeout=10)
+                    assert count == 128
             finally:
                 release.set()
-                responses = await asyncio.gather(*requests)
+                responses = await asyncio.wait_for(
+                    asyncio.gather(*requests), timeout=10
+                )
+            assert count == 128
             assert all(status == 200 for status, _, _ in responses)
 
     asyncio.run(go())
